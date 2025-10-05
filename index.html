@@ -1,0 +1,132 @@
+import streamlit as st
+import pandas as pd
+import altair as alt
+from io import BytesIO
+
+st.set_page_config(page_title="Public BNG Register", layout="wide")
+
+st.title("Public BNG Register")
+st.write("Upload the **consolidated** (site-level) and **long** (record-level) files. The app cross-checks both and shows summaries and breakdowns.")
+
+@st.cache_data
+def load_any(file):
+    if file is None:
+        return None
+    name = file.name.lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(file)
+    else:
+        # Excel
+        return pd.read_excel(file)
+
+col1, col2 = st.columns(2)
+with col1:
+    con_file = st.file_uploader("Consolidated file (CSV/XLSX)", type=["csv","xlsx","xls"], key="con")
+with col2:
+    long_file = st.file_uploader("Long file (CSV/XLSX)", type=["csv","xlsx","xls"], key="long")
+
+con = load_any(con_file)
+lon = load_any(long_file)
+
+def first_present(d, cols):
+    for c in cols:
+        if c in d.columns:
+            return c
+    return None
+
+if con is not None and lon is not None:
+    st.success(f"Loaded consolidated: {len(con):,} rows; long: {len(lon):,} rows")
+
+    # Identify likely columns
+    site_cols = ["Site ID","SiteID","Reference","Ref","Site Reference"]
+    date_cols = ["Date","Submission Date","Registered Date","Registration Date","Last Updated"]
+    unit_cols = ["Total Units","Total Biodiversity Units","Net Units","Net Gain Units","Total BNG Units"]
+
+    site_col_con = first_present(con, site_cols) or con.columns[0]
+    site_col_lon = first_present(lon, site_cols) or lon.columns[0]
+    date_col = first_present(con, date_cols)
+    unit_col = first_present(con, unit_cols)
+
+    # Cross-check sites
+    con_sites = set(con[site_col_con].astype(str).str.strip())
+    lon_sites = set(lon[site_col_lon].astype(str).str.strip())
+    only_con = sorted(con_sites - lon_sites)
+    only_lon = sorted(lon_sites - con_sites)
+
+    with st.expander("Dataset cross-check", expanded=True):
+        colA, colB, colC = st.columns(3)
+        colA.metric("Sites in consolidated", f"{len(con_sites):,}")
+        colB.metric("Sites in long", f"{len(lon_sites):,}")
+        colC.metric("Overlap", f"{len(con_sites & lon_sites):,}")
+        if only_con or only_lon:
+            st.warning(f"{len(only_con):,} only in consolidated; {len(only_lon):,} only in long")
+            with st.expander("Sites only in consolidated"):
+                st.write(only_con[:500])
+            with st.expander("Sites only in long"):
+                st.write(only_lon[:500])
+        else:
+            st.success("Datasets appear consistent")
+
+    # Snapshot + totals
+    left, mid, right = st.columns(3)
+    left.metric("Total sites (consolidated)", f"{len(con_sites):,}")
+
+    if date_col:
+        d = pd.to_datetime(con[date_col], errors="coerce").dropna()
+        if len(d):
+            left.write(f"Date range: **{d.min().date()} → {d.max().date()}**")
+    if unit_col:
+        total_units = pd.to_numeric(con[unit_col], errors="coerce").fillna(0).sum()
+        mid.metric("Estimated total units", f"{total_units:,.0f}")
+
+    # Filters
+    st.markdown("### Filters")
+    # Try to detect common filters
+    region_col = [c for c in con.columns if "region" in c.lower()]
+    lpa_col = [c for c in con.columns if "authority" in c.lower() or "lpa" in c.lower()]
+    dev_col = [c for c in con.columns if "developer" in c.lower() or "applicant" in c.lower()]
+
+    fcol1, fcol2, fcol3 = st.columns(3)
+    region = fcol1.selectbox("Region", ["(All)"] + (sorted(con[region_col[0]].dropna().unique().tolist()) if region_col else []))
+    lpa = fcol2.selectbox("LPA / Authority", ["(All)"] + (sorted(con[lpa_col[0]].dropna().unique().tolist()) if lpa_col else []))
+    dev = fcol3.selectbox("Developer", ["(All)"] + (sorted(con[dev_col[0]].dropna().unique().tolist()) if dev_col else []))
+
+    filtered = con.copy()
+    if region != "(All)" and region_col:
+        filtered = filtered[filtered[region_col[0]] == region]
+    if lpa != "(All)" and lpa_col:
+        filtered = filtered[filtered[lpa_col[0]] == lpa]
+    if dev != "(All)" and dev_col:
+        filtered = filtered[filtered[dev_col[0]] == dev]
+
+    st.markdown("### Sites (from consolidated)")
+    st.dataframe(filtered.head(1000))
+
+    # Habitat breakdown (from long)
+    st.markdown("### Habitat breakdown (from long)")
+    habitat_col_candidates = ["Habitat Type","Habitat","Type","BNG Habitat Type"]
+    unit_col_long_candidates = ["Units","Habitat Units","BNG Units","Biodiversity Units","Metric Units","Amount"]
+
+    hcol = first_present(lon, habitat_col_candidates) or lon.columns[0]
+    ucol = first_present(lon, unit_col_long_candidates) or lon.columns[-1]
+
+    lon[ucol] = pd.to_numeric(lon[ucol], errors="coerce").fillna(0)
+    habitat_agg = (lon.groupby(hcol, dropna=False)[ucol].sum().reset_index()
+                     .rename(columns={hcol:"Habitat", ucol:"Units"}).sort_values("Units", ascending=False))
+
+    chart = (alt.Chart(habitat_agg[:30])
+             .mark_bar(color="#2a9d8f")
+             .encode(x=alt.X("Units:Q", title="Units"),
+                     y=alt.Y("Habitat:N", sort="-x", title="Habitat"))
+             .properties(height=500))
+    st.altair_chart(chart, use_container_width=True)
+
+    # Downloadables
+    st.markdown("### Export")
+    def to_csv(df):
+        return df.to_csv(index=False).encode('utf-8')
+    st.download_button("Download filtered consolidated (CSV)", to_csv(filtered), "consolidated_filtered.csv", "text/csv")
+    st.download_button("Download habitat breakdown (CSV)", to_csv(habitat_agg), "habitat_breakdown.csv", "text/csv")
+
+else:
+    st.info("Upload both files to begin.")
