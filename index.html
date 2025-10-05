@@ -1,132 +1,267 @@
-import streamlit as st
-import pandas as pd
-import altair as alt
-from io import BytesIO
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Public BNG Register</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Minimal styling -->
+  <link href="https://unpkg.com/sakura.css/css/sakura.css" rel="stylesheet" type="text/css">
+  <!-- Chart.js for charts -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <!-- PapaParse for CSV; SheetJS for XLSX (optional) -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <style>
+    .row { display:flex; gap:1rem; flex-wrap:wrap; }
+    .card { border:1px solid #e5e5e5; padding:1rem; border-radius:8px; flex:1; min-width:240px;}
+    canvas { max-width:100%; }
+    .warn { background:#fff3cd; padding:0.5rem 0.75rem; border-radius:6px; }
+    .ok { background:#e8f5e9; padding:0.5rem 0.75rem; border-radius:6px; }
+    table { width:100%; overflow:auto; display:block; }
+    th, td { white-space:nowrap; }
+    .controls { display:flex; gap:.5rem; flex-wrap:wrap; align-items:center; }
+    input[type=text]{ width:100%; max-width:520px; }
+  </style>
+</head>
+<body>
+  <h1>Public BNG Register</h1>
+  <p>Loads two datasets (consolidated + long), cross-checks them, and shows summaries and habitat breakdowns.</p>
 
-st.set_page_config(page_title="Public BNG Register", layout="wide")
+  <div class="controls">
+    <label>Consolidated CSV/XLSX URL:
+      <input id="conUrl" type="text" placeholder="https://.../consolidated.csv">
+    </label>
+    <label>Long CSV/XLSX URL:
+      <input id="longUrl" type="text" placeholder="https://.../long.csv">
+    </label>
+    <button id="loadBtn">Load</button>
+  </div>
 
-st.title("Public BNG Register")
-st.write("Upload the **consolidated** (site-level) and **long** (record-level) files. The app cross-checks both and shows summaries and breakdowns.")
+  <p>Or upload files locally (privacy-friendly; stays in browser):</p>
+  <div class="controls">
+    <input id="conFile" type="file" accept=".csv,.xlsx,.xls">
+    <input id="longFile" type="file" accept=".csv,.xlsx,.xls">
+    <button id="uploadBtn">Use Uploaded Files</button>
+  </div>
 
-@st.cache_data
-def load_any(file):
-    if file is None:
-        return None
-    name = file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(file)
-    else:
-        # Excel
-        return pd.read_excel(file)
+  <div id="status"></div>
 
-col1, col2 = st.columns(2)
-with col1:
-    con_file = st.file_uploader("Consolidated file (CSV/XLSX)", type=["csv","xlsx","xls"], key="con")
-with col2:
-    long_file = st.file_uploader("Long file (CSV/XLSX)", type=["csv","xlsx","xls"], key="long")
+  <div class="row">
+    <div class="card">
+      <h3>Snapshot</h3>
+      <div id="snapshot"></div>
+    </div>
+    <div class="card">
+      <h3>Cross-check</h3>
+      <div id="crosscheck"></div>
+    </div>
+    <div class="card">
+      <h3>Totals</h3>
+      <div id="totals"></div>
+    </div>
+  </div>
 
-con = load_any(con_file)
-lon = load_any(long_file)
+  <h3>Habitat breakdown (from long file)</h3>
+  <canvas id="habitatChart" height="140"></canvas>
 
-def first_present(d, cols):
-    for c in cols:
-        if c in d.columns:
-            return c
-    return None
+  <h3>Sites (from consolidated file)</h3>
+  <div class="controls">
+    <input id="siteFilter" type="text" placeholder="Filter by site name, LPA, developer, region..." />
+  </div>
+  <table id="sitesTable">
+    <thead><tr id="sitesHead"></tr></thead>
+    <tbody id="sitesBody"></tbody>
+  </table>
 
-if con is not None and lon is not None:
-    st.success(f"Loaded consolidated: {len(con):,} rows; long: {len(lon):,} rows")
+<script>
+const statusEl = document.getElementById('status');
+const crossEl = document.getElementById('crosscheck');
+const snapEl = document.getElementById('snapshot');
+const totalsEl = document.getElementById('totals');
+const sitesHead = document.getElementById('sitesHead');
+const sitesBody = document.getElementById('sitesBody');
+const siteFilter = document.getElementById('siteFilter');
 
-    # Identify likely columns
-    site_cols = ["Site ID","SiteID","Reference","Ref","Site Reference"]
-    date_cols = ["Date","Submission Date","Registered Date","Registration Date","Last Updated"]
-    unit_cols = ["Total Units","Total Biodiversity Units","Net Units","Net Gain Units","Total BNG Units"]
+let consolidated = [];
+let longrows = [];
+let habitatChart;
 
-    site_col_con = first_present(con, site_cols) or con.columns[0]
-    site_col_lon = first_present(lon, site_cols) or lon.columns[0]
-    date_col = first_present(con, date_cols)
-    unit_col = first_present(con, unit_cols)
+function readCSVFromURL(url){
+  return new Promise((resolve, reject)=>{
+    Papa.parse(url, {
+      download: true,
+      header: true,
+      skipEmptyLines: true,
+      complete: res => resolve(res.data),
+      error: err => reject(err)
+    });
+  });
+}
+function readFile(input){
+  return new Promise((resolve, reject)=>{
+    const file = input.files[0];
+    if(!file) return resolve(null);
+    const ext = file.name.toLowerCase().split('.').pop();
+    const reader = new FileReader();
+    if(ext === 'csv'){
+      reader.onload = () => {
+        const parsed = Papa.parse(reader.result, { header:true, skipEmptyLines:true });
+        resolve(parsed.data);
+      };
+      reader.onerror = reject;
+      reader.readAsText(file);
+    } else {
+      reader.onload = () => {
+        const wb = XLSX.read(new Uint8Array(reader.result), {type:'array'});
+        const first = wb.SheetNames[0];
+        const rows = XLSX.utils.sheet_to_json(wb.Sheets[first], {defval:""});
+        resolve(rows);
+      };
+      reader.onerror = reject;
+      reader.readAsArrayBuffer(file);
+    }
+  });
+}
+function coerceNumber(v){
+  if (v === null || v === undefined) return 0;
+  if (typeof v === 'number') return v;
+  const n = parseFloat(String(v).replace(/[, ]/g,''));
+  return isNaN(n) ? 0 : n;
+}
 
-    # Cross-check sites
-    con_sites = set(con[site_col_con].astype(str).str.strip())
-    lon_sites = set(lon[site_col_lon].astype(str).str.strip())
-    only_con = sorted(con_sites - lon_sites)
-    only_lon = sorted(lon_sites - con_sites)
+function summarize(){
+  // Snapshot
+  const siteIdCols = ['Site ID','SiteID','Reference','Ref','Site Reference'];
+  const dateCols = ['Date','Submission Date','Registered Date','Registration Date','Last Updated'];
+  const unitCols = ['Total Units','Total Biodiversity Units','Net Units','Net Gain Units','Total BNG Units'];
 
-    with st.expander("Dataset cross-check", expanded=True):
-        colA, colB, colC = st.columns(3)
-        colA.metric("Sites in consolidated", f"{len(con_sites):,}")
-        colB.metric("Sites in long", f"{len(lon_sites):,}")
-        colC.metric("Overlap", f"{len(con_sites & lon_sites):,}")
-        if only_con or only_lon:
-            st.warning(f"{len(only_con):,} only in consolidated; {len(only_lon):,} only in long")
-            with st.expander("Sites only in consolidated"):
-                st.write(only_con[:500])
-            with st.expander("Sites only in long"):
-                st.write(only_lon[:500])
-        else:
-            st.success("Datasets appear consistent")
+  const siteCount = new Set(consolidated.map(r=>{
+    for(const c of siteIdCols){ if(r[c]) return String(r[c]).trim(); }
+    return JSON.stringify(r);
+  })).size;
 
-    # Snapshot + totals
-    left, mid, right = st.columns(3)
-    left.metric("Total sites (consolidated)", f"{len(con_sites):,}")
+  // Try and find a date range
+  let dates = [];
+  consolidated.forEach(r=>{
+    for(const c of dateCols){
+      if(r[c]){
+        const d = new Date(r[c]);
+        if(!isNaN(d)) dates.push(d);
+      }
+    }
+  });
+  dates.sort((a,b)=>a-b);
+  const fmt = d => d ? d.toISOString().slice(0,10) : 'n/a';
 
-    if date_col:
-        d = pd.to_datetime(con[date_col], errors="coerce").dropna()
-        if len(d):
-            left.write(f"Date range: **{d.min().date()} → {d.max().date()}**")
-    if unit_col:
-        total_units = pd.to_numeric(con[unit_col], errors="coerce").fillna(0).sum()
-        mid.metric("Estimated total units", f"{total_units:,.0f}")
+  // Totals (best-effort)
+  let totalUnits = 0;
+  consolidated.forEach(r=>{
+    for(const c of unitCols){
+      if(r[c]) { totalUnits += coerceNumber(r[c]); break; }
+    }
+  });
 
-    # Filters
-    st.markdown("### Filters")
-    # Try to detect common filters
-    region_col = [c for c in con.columns if "region" in c.lower()]
-    lpa_col = [c for c in con.columns if "authority" in c.lower() or "lpa" in c.lower()]
-    dev_col = [c for c in con.columns if "developer" in c.lower() or "applicant" in c.lower()]
+  snapEl.innerHTML = `
+    <div><strong>Sites:</strong> ${siteCount}</div>
+    <div><strong>Date range (from consolidated):</strong> ${fmt(dates[0])} → ${fmt(dates[dates.length-1])}</div>
+  `;
+  totalsEl.innerHTML = `
+    <div><strong>Estimated total units:</strong> ${totalUnits.toLocaleString()}</div>
+  `;
 
-    fcol1, fcol2, fcol3 = st.columns(3)
-    region = fcol1.selectbox("Region", ["(All)"] + (sorted(con[region_col[0]].dropna().unique().tolist()) if region_col else []))
-    lpa = fcol2.selectbox("LPA / Authority", ["(All)"] + (sorted(con[lpa_col[0]].dropna().unique().tolist()) if lpa_col else []))
-    dev = fcol3.selectbox("Developer", ["(All)"] + (sorted(con[dev_col[0]].dropna().unique().tolist()) if dev_col else []))
+  // Cross-check sites present in both
+  const conKeys = new Set(consolidated.map(r=>{
+    for(const c of siteIdCols){ if(r[c]) return String(r[c]).trim(); }
+    return '';
+  }).filter(Boolean));
+  const longKeys = new Set(longrows.map(r=>{
+    for(const c of siteIdCols){ if(r[c]) return String(r[c]).trim(); }
+    return '';
+  }).filter(Boolean));
 
-    filtered = con.copy()
-    if region != "(All)" and region_col:
-        filtered = filtered[filtered[region_col[0]] == region]
-    if lpa != "(All)" and lpa_col:
-        filtered = filtered[filtered[lpa_col[0]] == lpa]
-    if dev != "(All)" and dev_col:
-        filtered = filtered[filtered[dev_col[0]] == dev]
+  let inConNotLong = 0, inLongNotCon = 0;
+  conKeys.forEach(k=>{ if(!longKeys.has(k)) inConNotLong++; });
+  longKeys.forEach(k=>{ if(!conKeys.has(k)) inLongNotCon++; });
 
-    st.markdown("### Sites (from consolidated)")
-    st.dataframe(filtered.head(1000))
+  const ok = inConNotLong===0 && inLongNotCon===0;
+  crossEl.innerHTML = `
+    <div class="${ok ? 'ok':'warn'}">
+      ${ok ? 'Datasets appear consistent.' :
+      `Potential mismatch: ${inConNotLong} site(s) only in consolidated; ${inLongNotCon} site(s) only in long.`}
+    </div>
+  `;
+}
 
-    # Habitat breakdown (from long)
-    st.markdown("### Habitat breakdown (from long)")
-    habitat_col_candidates = ["Habitat Type","Habitat","Type","BNG Habitat Type"]
-    unit_col_long_candidates = ["Units","Habitat Units","BNG Units","Biodiversity Units","Metric Units","Amount"]
+function drawHabitatChart(){
+  // Guess habitat + units columns in long file
+  const habitatCols = ['Habitat Type','Habitat','Type','BNG Habitat Type'];
+  const unitCols = ['Units','Habitat Units','BNG Units','Biodiversity Units','Metric Units','Amount'];
 
-    hcol = first_present(lon, habitat_col_candidates) or lon.columns[0]
-    ucol = first_present(lon, unit_col_long_candidates) or lon.columns[-1]
+  const pickCol = (row, candidates) => candidates.find(c => c in row);
+  const hcol = longrows.length ? pickCol(longrows[0], habitatCols) : null;
+  const ucol = longrows.length ? pickCol(longrows[0], unitCols) : null;
 
-    lon[ucol] = pd.to_numeric(lon[ucol], errors="coerce").fillna(0)
-    habitat_agg = (lon.groupby(hcol, dropna=False)[ucol].sum().reset_index()
-                     .rename(columns={hcol:"Habitat", ucol:"Units"}).sort_values("Units", ascending=False))
+  const agg = new Map();
+  longrows.forEach(r=>{
+    const h = hcol ? String(r[hcol]).trim() : 'Unknown';
+    const u = ucol ? coerceNumber(r[ucol]) : 0;
+    agg.set(h, (agg.get(h)||0) + u);
+  });
 
-    chart = (alt.Chart(habitat_agg[:30])
-             .mark_bar(color="#2a9d8f")
-             .encode(x=alt.X("Units:Q", title="Units"),
-                     y=alt.Y("Habitat:N", sort="-x", title="Habitat"))
-             .properties(height=500))
-    st.altair_chart(chart, use_container_width=True)
+  const labels = [...agg.keys()];
+  const data = labels.map(l=> agg.get(l));
+  const ctx = document.getElementById('habitatChart');
+  if (habitatChart) habitatChart.destroy();
+  habitatChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{ label: 'Units', data, backgroundColor: '#2a9d8f' }]
+    },
+    options: {
+      indexAxis: labels.length > 8 ? 'y' : 'x',
+      plugins: { legend: { display:false } },
+      scales: { x: { ticks: { precision:0 } } }
+    }
+  });
+}
 
-    # Downloadables
-    st.markdown("### Export")
-    def to_csv(df):
-        return df.to_csv(index=False).encode('utf-8')
-    st.download_button("Download filtered consolidated (CSV)", to_csv(filtered), "consolidated_filtered.csv", "text/csv")
-    st.download_button("Download habitat breakdown (CSV)", to_csv(habitat_agg), "habitat_breakdown.csv", "text/csv")
+function renderSites(){
+  if (!consolidated.length){ sitesHead.innerHTML=''; sitesBody.innerHTML=''; return; }
+  const columns = Object.keys(consolidated[0]).slice(0, 10); // keep to first 10 cols for simplicity
+  sitesHead.innerHTML = columns.map(c=>`<th>${c}</th>`).join('');
+  const q = siteFilter.value.toLowerCase();
+  const filtered = q ? consolidated.filter(r=> Object.values(r).some(v=> String(v).toLowerCase().includes(q))) : consolidated;
 
-else:
-    st.info("Upload both files to begin.")
+  sitesBody.innerHTML = filtered.slice(0, 500).map(r=>{
+    return `<tr>${columns.map(c=>`<td>${r[c] ?? ''}</td>`).join('')}</tr>`;
+  }).join('');
+}
+
+async function loadFromURLs(){
+  const cUrl = document.getElementById('conUrl').value.trim();
+  const lUrl = document.getElementById('longUrl').value.trim();
+  if(!cUrl || !lUrl){ alert('Please provide both URLs.'); return; }
+  statusEl.textContent = 'Loading...';
+  consolidated = await readCSVFromURL(cUrl);
+  longrows = await readCSVFromURL(lUrl);
+  statusEl.textContent = `Loaded ${consolidated.length} consolidated rows and ${longrows.length} long rows.`;
+  summarize(); drawHabitatChart(); renderSites();
+}
+
+async function loadFromFiles(){
+  statusEl.textContent = 'Reading files...';
+  const con = await readFile(document.getElementById('conFile'));
+  const lon = await readFile(document.getElementById('longFile'));
+  if(!con || !lon){ alert('Please choose both files.'); return; }
+  consolidated = con; longrows = lon;
+  statusEl.textContent = `Loaded ${consolidated.length} consolidated rows and ${longrows.length} long rows.`;
+  summarize(); drawHabitatChart(); renderSites();
+}
+
+document.getElementById('loadBtn').addEventListener('click', loadFromURLs);
+document.getElementById('uploadBtn').addEventListener('click', loadFromFiles);
+siteFilter.addEventListener('input', renderSites);
+</script>
+</body>
+</html>
